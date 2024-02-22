@@ -82,6 +82,8 @@ def extract(filename, **kwargs):
 
     verbosity = kwargs.get('verbosity', 0)
     step = kwargs.get('step', 1)
+    step = step + (step% 0.032) #step recalculated as a multiple of the base refresh rate (32 ms)
+
     wlim = kwargs.get('wlim', None)
     #-- If not specific wavlengths, truncate to good wavelengths
     #-- for each detector
@@ -94,6 +96,7 @@ def extract(filename, **kwargs):
     xlim = kwargs.get('xlim', (0, 16384))
     ylim = kwargs.get('ylim', None)
     filter_airglow = kwargs.get('filter_airglow', True)
+    debug = kwargs.get('debug',False)
 
     if fits.getval(filename, 'OBSTYPE') == 'IMAGING':
         print("Imaging observation found, resetting limits.")
@@ -101,7 +104,7 @@ def extract(filename, **kwargs):
         ylim = (0, 512)
         wlim = (-1, 1)
 
-    SECOND_PER_MJD = 1.15741e-5
+    SECOND_PER_MJD = 1.1574074074074073e-05
 
     source_datasets = ','.join([os.path.basename(item) for item in input_files])
     meta = {'source': filename,
@@ -120,12 +123,13 @@ def extract(filename, **kwargs):
         print()
         print('Extracting from: {}'.format(input_files))
         print('With arguments:')
-        print('With arguments:')
+        #print('With arguments:')
         print('step : {}'.format(step))
         print('wlim : {}'.format(wlim))
         print('xlim : {}'.format(xlim))
         print('ylim : {}'.format(ylim))
         print('filter_airglow : {}'.format(filter_airglow))
+        print('note: step recalculated to previous multiple of the time resolution element (32ms)')
         print()
 
     #time = np.array([round(val, 3) for val in hdu[1].data['time']]).astype(np.float64)
@@ -140,11 +144,11 @@ def extract(filename, **kwargs):
         exptime = max(exptime, hdu[1].header['EXPTIME'])
 
     if end > exptime:
-        print("WARNING: data times go to {}, beyond exptime: {}".format(end, exptime))
+        print("WARNING: data times go to {}, beyond exptime: {}.".format(end, exptime))
 
-    end = min(end, exptime)
+    #end = min(end, exptime) #no #we decide to change this
 
-    all_steps = np.arange(start, end+step, step)
+    all_steps =np.float64(np.arange(start, end+step, step))
 
     if all_steps[-1] > end:
         truncate = True
@@ -155,6 +159,7 @@ def extract(filename, **kwargs):
     flux = 0
     background = 0
     background_flux = 0
+    n_pix=0
 
     for segment, hdu in six.iteritems(input_hdus):
 
@@ -169,44 +174,59 @@ def extract(filename, **kwargs):
 
         if verbosity:
             print(xlim, ystart, yend, wlim, hdu[1].header['sdqflags'])
-        index = extract_index(hdu,
+        index = extract_index_multi_wlims(hdu,
                               xlim[0], xlim[1],
                               ystart, yend,
-                              wlim[0], wlim[1],
+                              wlim,#[0], wlim[1],
                               hdu[1].header['sdqflags'],
                               filter_airglow=filter_airglow)
-        if verbosity:
-            print("{} #{} events".format(segment, len(index)))
+        
 
+        print('effective wavelenght range')
+        print(np.min(hdu['events'].data['wavelength'][index]),np.max(hdu['events'].data['wavelength'][index]))
+        meta['wlim'] = [np.min(hdu['events'].data['wavelength'][index]),np.max(hdu['events'].data['wavelength'][index])]
 
-        n_pixels = calc_npixels(hdu, index, xlim)
+        n_pixels = calc_npixels(hdu, index, xlim, wlim)
 
         gross += np.histogram(hdu['events'].data['time'][index],
                               all_steps,
                               weights=hdu['events'].data['epsilon'][index])[0]
-
-        response_array = get_fluxes(hdu, index).mean()
+        
+        if debug: 
+            edges = np.histogram(hdu['events'].data['time'][index],
+                              all_steps,
+                              weights=hdu['events'].data['epsilon'][index])[1]
+            print("#{} time stamps: {}".format(len(all_steps),all_steps))
+            print("#{} bin edges: {}".format(len(edges),edges))
+        if verbosity:
+            print("segment {} #{} events".format(segment, len(index)))
+            print("#{} gross".format(len(gross)))
+        response_array = get_fluxes(hdu, index)#np.median(get_fluxes(hdu, index))#.mean()
         tds_corr = get_tds(hdu, index)
 
         weights = hdu['events'].data['epsilon'][index] / step / tds_corr / response_array
         flux +=  np.histogram(hdu['events'].data['time'][index], all_steps, weights=weights)[0] / n_pixels
 
+        n_pix += np.ones_like(np.histogram(hdu['events'].data['time'][index],
+                              all_steps,
+                              weights=hdu['events'].data['epsilon'][index])[0])*n_pixels        
+
 
         ### Background calculation
         #print('Background fluxcal')
         bstart, bend = get_extraction_region(hdu, segment, 'background1')
-        index = extract_index(hdu,
+        index = extract_index_multi_wlims(hdu,
                               xlim[0], xlim[1],
                               bstart, bend,
-                              wlim[0], wlim[1],
+                              wlim,#[0], wlim[1],
                               hdu[1].header['sdqflags'],
                               filter_airglow=filter_airglow)
 
         bstart, bend = get_extraction_region(hdu, segment, 'background2')
-        index = np.hstack( (index, extract_index(hdu,
+        index = np.hstack( (index, extract_index_multi_wlims(hdu,
                                                  xlim[0], xlim[1],
                                                  bstart, bend,
-                                                 wlim[0], wlim[1],
+                                                 wlim,#[0], wlim[1],
                                                  hdu[1].header['sdqflags'],
                                                  filter_airglow=filter_airglow) ) )
 
@@ -222,13 +242,14 @@ def extract(filename, **kwargs):
                                                    all_steps,
                                                    weights=weights)[0]) / n_pixels
 
-
+    times = np.mean([all_steps[:-1],all_steps[1:]],axis=0)
     gross = gross
     flux = flux - background_flux
+    flux[flux<0] = 0
     background = background
-    mjd = hdu[1].header['EXPSTART'] + np.array(all_steps[:-1]) * SECOND_PER_MJD
+    mjd = hdu[1].header['EXPSTART'] + np.float_(np.array(times)) * SECOND_PER_MJD
     bins = np.ones(len(gross)) * step
-    times = all_steps[:-1]
+
 
     if truncate:
         if verbosity:
@@ -240,6 +261,7 @@ def extract(filename, **kwargs):
         mjd = mjd[:-1]
         bins = bins[:-1]
         times = times[:-1]
+        n_pix = n_pix[:-1]
 
     data = {'dataset': np.ones(times.shape),
             'times': times,
@@ -247,11 +269,13 @@ def extract(filename, **kwargs):
             'bins': bins,
             'gross': gross,
             'background': background,
-            'flux': flux}
+            'flux': flux,
+            'n_pix':n_pix}
+
 
     if verbosity:
         print('Finished extraction for {}'.format(filename))
-        print()
+        print('#{} gross'.format(gross))
 
     return data, meta
 
@@ -286,13 +310,25 @@ def collect_inputs(filename):
 
 #-------------------------------------------------------------------------------
 
-def calc_npixels(hdu, index, xlim):
-    try:
-        max_xpix = round(min(hdu['events'].data['XCORR'][index].max(), xlim[1]))
-        min_xpix = round(max(hdu['events'].data['XCORR'][index].min(), xlim[0]))
-        n_pixels = (max_xpix - min_xpix) + 1
-    except ValueError:
-        n_pixels = 1
+def calc_npixels(hdu, index, xlim,wlim):
+    if len(wlim)>2:
+        n_pixels=0
+        
+        for i in range(0,len(wlim),2):
+             sub_index = ((hdu[1].data['WAVELENGTH']>= wlim[i]) & (hdu[1].data['WAVELENGTH']>= wlim[i+1]))
+             max_xpix = round(min(hdu['events'].data['XCORR'][sub_index].max(), xlim[1]))
+             min_xpix = round(max(hdu['events'].data['XCORR'][sub_index].min(), xlim[0]))
+             n_pixels += (max_xpix - min_xpix) + 1
+             print(i,max_xpix,min_xpix,n_pixels)
+
+
+    else:
+      try:
+          max_xpix = round(min(hdu['events'].data['XCORR'][index].max(), xlim[1]))
+          min_xpix = round(max(hdu['events'].data['XCORR'][index].min(), xlim[0]))
+          n_pixels = (max_xpix - min_xpix) + 1
+      except ValueError:
+          n_pixels = 1
 
     return n_pixels
 
@@ -335,9 +371,13 @@ def extract_index(hdu, x_start, x_end,
 
     """
 
-    if filter_airglow:
+    if filter_airglow == True:
         lyman = (1208, 1225)
         oxygen = (1298, 1312)
+        #print('filtering ariglow')
+    elif filter_airglow == 'Lyman':
+        lyman = (1208, 1225)
+        oxygen = (w_end, w_start)
     else:
         lyman = (w_end, w_start)
         oxygen = (w_end, w_start)
@@ -350,7 +390,7 @@ def extract_index(hdu, x_start, x_end,
 
                           np.logical_not(hdu[1].data['DQ'] & sdqflags) &
 
-                          ((hdu[1].data['WAVELENGTH'] > w_start) &
+                          ((hdu[1].data['WAVELENGTH'] >= w_start) &
                            (hdu[1].data['WAVELENGTH'] < w_end)) &
 
                           ((hdu[1].data['WAVELENGTH'] > lyman[1])|
@@ -362,6 +402,81 @@ def extract_index(hdu, x_start, x_end,
     return data_index
 
 #-------------------------------------------------------------------------------
+def extract_index_multi_wlims(hdu, x_start, x_end,
+                  y_start, y_end, wlim, sdqflags=0,
+                  filter_airglow=True):
+    """
+    Extract event indeces from given HDU using input parameters.
+
+    Wavelength regions containing geocoronal airglow emission will be excluded
+    automatically.  These regions include Lyman Alpha between 1214 and 1217
+    Angstroms and Oxygen I from 1300 to 1308.
+
+
+    Parameters
+    ----------
+    hdu : HDUlist
+        Header Data Unit from COS corrtag file
+    x_start : float
+        Lower bound of events in pixel space
+    x_end : float
+        Upper bound of events in pixel space
+    y_start : float
+        Lower bound of events in pixel space
+    y_end : float
+        Upper bound of events in pixel space
+    w_start : float
+        Lower bound of events in wavelength space
+    w_end : float
+        Upper bound of events in wavelength space
+    sdqflags : int
+        Bitwise DQ value of bad events
+
+    Returns
+    -------
+    data_index : np.ndarray
+        Indeces of desired events
+
+    """
+    w_end, w_start = (np.max(wlim),np.min(wlim))
+
+    if filter_airglow == True:
+        lyman = (1208, 1225)
+        oxygen = (1298, 1312)
+        #print('filtering ariglow')
+    elif filter_airglow == 'Lyman':
+        lyman = (1208, 1225)
+        oxygen = (w_end, w_start)
+    else:
+        lyman = (w_end, w_start)
+        oxygen = (w_end, w_start)
+
+    wmask=((hdu[1].data['WAVELENGTH']>=wlim[0]) & 
+           (hdu[1].data['WAVELENGTH']<wlim[1]))
+    print(len(np.ones_like(hdu[1].data['WAVELENGTH'][wmask])))
+    if len(wlim) > 2:
+        for i in range(2,len(wlim),2):
+            wmask= wmask | ((hdu[1].data['WAVELENGTH']>=wlim[i]) & 
+                           (hdu[1].data['WAVELENGTH']<wlim[i+1]))
+            print(len(np.ones_like(hdu[1].data['WAVELENGTH'][wmask])))
+
+    data_index = np.where((hdu[1].data['XCORR'] >= x_start) &
+                          (hdu[1].data['XCORR'] < x_end) &
+
+                          (hdu[1].data['YCORR'] >= y_start) &
+                          (hdu[1].data['YCORR'] < y_end) &
+
+                          np.logical_not(hdu[1].data['DQ'] & sdqflags) &
+
+                          (wmask) &
+
+                          ((hdu[1].data['WAVELENGTH'] > lyman[1])|
+                           (hdu[1].data['WAVELENGTH'] < lyman[0])) &
+                          ((hdu[1].data['WAVELENGTH'] > oxygen[1]) |
+                           (hdu[1].data['WAVELENGTH'] < oxygen[0]))
+                          )[0]
+
+    return data_index
 
 def get_both_filenames(filename):
     """ Get a list of both filenames for FUV data
@@ -492,8 +607,7 @@ def get_tds(hdu, index):
     tds_data = fits.getdata(tdsfile, ext=1)
     REF_TIME = fits.getval(tdsfile, 'REF_TIME', ext=1)
     mode_index = np.where((tds_data['OPT_ELEM'] == hdu[0].header['opt_elem']) &
-                          (tds_data['CENWAVE'] == hdu[0].header['cenwave']) &
-                          ((tds_data['APERTURE'] == hdu[0].header['aperture']) | (tds_data['APERTURE'] == 'ANY')) &
+                          (tds_data['APERTURE'] == hdu[0].header['aperture']) &
                           (tds_data['SEGMENT'] == hdu[0].header['segment']))[0]
 
 

@@ -121,8 +121,9 @@ def read(source=None, **kwargs):
                 'counts': np.array([]),
                 'error': np.array([]),
                 'flux_error': np.array([]),
-                'net': np.array([]),
-                'signal_to_noise': np.array([])}
+                'rate': np.array([]), 
+                'signal_to_noise': np.array([]),
+                'npix':np.array([])}
 
         meta = {'filename': None}
 
@@ -173,9 +174,11 @@ def read(source=None, **kwargs):
 
     data['counts'] = data['gross'] - data['background']
     data['error'] = np.sqrt(data['gross'] + data['background'])
-    data['flux_error'] = np.sqrt(data['gross'] + data['background']) / (data['gross'] - data['background']) * data['flux']
-    data['net'] = (data['gross'] - data['background']) / data['bins']
-    data['signal_to_noise'] = data['gross'] / np.sqrt(data['gross'] + data['background'])
+    data['counts'][data['counts']<0]=0
+    data['flux_error'] = np.nan_to_num(np.sqrt(data['gross'] + data['background']) / (data['gross'] - data['background']) * data['flux'])
+    data['rate'] = (data['gross'] - data['background']) / data['bins']
+    data['rate'][data['rate']<0]=0
+    data['signal_to_noise'] = np.nan_to_num(data['gross'] / np.sqrt(data['gross'] + data['background']))
 
     return Table(data, meta=meta)
 
@@ -201,7 +204,7 @@ def quicklook(filename):
 
 #-------------------------------------------------------------------------------
 
-def composite(filelist, output, trim=True, **kwargs):
+def composite(filelist, output=None, trim=True, **kwargs):
     """Creates a composite lightcurve from files in filelist and saves
     it to the save_loc.
 
@@ -218,6 +221,8 @@ def composite(filelist, output, trim=True, **kwargs):
     print("Creating composite lightcurve from:")
     print("\n".join(filelist))
     override = {}
+
+    usr_wlim = kwargs.get('wlim', None)
 
     for i, filename in enumerate(filelist):
         with fits.open(filename) as hdu:
@@ -246,7 +251,7 @@ def composite(filelist, output, trim=True, **kwargs):
                 HARD_WMAX = 9000
 
             index = np.where((np.logical_not(dq & sdqflags)) &
-                             (wave > HARD_WMIN) &
+                             (wave >= HARD_WMIN) &
                              (wave < HARD_WMAX) &
                              (xcorr >= 0) &
                              (ycorr >= 0))
@@ -261,40 +266,50 @@ def composite(filelist, output, trim=True, **kwargs):
             else:
                 wmax = min(wmax, wave[index].max())
                 wmin = max(wmin, wave[index].min())
-                print(wmin, '-->', wmax)
+                #print(wmin, '-->', wmax)
 
+    #checking for usr wlim
+    if usr_wlim is not None:
+        wmin = max(wmin,min(usr_wlim))
+        wmax = min(wmax,max(usr_wlim))
 
-    if trim:
-        print('Using wavelength range of: {}-{}'.format(wmin, wmax))
+    if trim and len(kwargs['wlim'])<=2:
+        print('Trimming the wavelenght common for all the files\nUsing wavelength range of: {:10.3f} -{:10.3f}'.format(wmin, wmax))
         kwargs['wlim'] = (wmin, wmax)
 
     override['wmin'] = wmin
     override['wmax'] = wmax
+    override['binsize'] = kwargs.get('step', 1)
 
     all_lc = []
     for filename in filelist:
         tmp_lc = read(filename, **kwargs)
         if np.any(tmp_lc['gross'] == 0):
-            continue
-        else:
-            all_lc.append(tmp_lc)
+            print('WARNING: gross counts = 0 in {}'.format(filename))
+            #continue
+        #else:
+        #    all_lc.append(tmp_lc)
+        all_lc.append(tmp_lc)
+    print('%d/%d files loaded'%(len(all_lc),len(filelist)))
 
     for i, lc in enumerate(all_lc):
         if i == 0:
             out_lc = lc
         else:
             lc['dataset'] = i+1
-            out_lc = vstack([out_lc, lc], metadata_conflicts='warn')
-
-    if output.endswith('.fits') or output.endswith('.fits.gz'):
-        for key in list(out_lc.meta.keys()):
-            if len(key) > 8:
-                print("Deleting key {} from output header:".format(key))
-                del out_lc.meta[key]
-
-    out_lc.write(output)
-
-    prepare_header(output, filelist, override)
+            out_lc = vstack([out_lc, lc], metadata_conflicts='silent')
+    if output:
+        if output.endswith('.fits') or output.endswith('.fits.gz'):
+            for key in list(out_lc.meta.keys()):
+                if len(key) > 8:
+                    print("Deleting key {} from output header:".format(key))
+                    del out_lc.meta[key]
+    
+        out_lc.write(output)
+    
+        prepare_header(output, filelist, override)
+    else:
+        return out_lc
 
 #-------------------------------------------------------------------------------
 
@@ -305,9 +320,10 @@ def prepare_header(filename, filelist, override={}):
     detector = set()
     filter = set()
 
+
     for i, exposure in enumerate(filelist):
         with fits.open(exposure) as hdu:
-            print(exposure)
+            print(exposure) #
             telescop.add(hdu[0].header['TELESCOP'])
             instrume.add(hdu[0].header['INSTRUME'])
             detector.add(hdu[0].header['DETECTOR'])
@@ -320,17 +336,23 @@ def prepare_header(filename, filelist, override={}):
                 targname = hdu[0].header['targname']
                 tardescr = hdu[0].header.get('TARDESCR', '')
                 tardesc2 = hdu[0].header.get('TARDESC2', '')
-
+                PI_L = (hdu[0].header['PR_INV_L'])
+                PI_M = (hdu[0].header['PR_INV_M'])
+                PI_F = (hdu[0].header['PR_INV_F'])
+                PROPID = hdu[0].header.get('PROPOSID', '')
+            
     with fits.open(filename, mode='update') as hdu:
         #-- HSLP keywords
-        hdu[0].header['PROPOSID'] = 13902
-        hdu[0].header['HLSPLEAD'] = 'Justin C. Ely'
-        hdu[0].header['PR_INV_L'] = 'Ely'
-        hdu[0].header['PR_INV_F'] = 'Justin'
-        hdu[0].header['PR_INV_M'] = 'Charles'
+        hdu[0].header['PROPOSID'] = PROPID
+        hdu[0].header['PI'] = PI_F +' '+ PI_M +' '+ PI_L
+        hdu[0].header['PR_INV_L'] = PI_L
+        hdu[0].header['PR_INV_F'] = PI_F
+        hdu[0].header['PR_INV_M'] = PI_M
         hdu[0].header['HLSPNAME'] = 'The Lightcurve Legacy of COS and STIS'
         hdu[0].header['HLSPACRN'] = 'LLOCS'
+        hdu[0].header['COMENT'] = 'Adapted from Ely J. code by Castro Segura N.'
         hdu[0].header['CITATION'] = ''
+
 
         hdu[0].header['RA_TARG'] = ra_targ
         hdu[0].header['DEC_TARG'] = dec_targ
@@ -365,10 +387,22 @@ def prepare_header(filename, filelist, override={}):
 
         hdu[1].header['WMIN'] = override.get('wmin')
         hdu[1].header['WMAX'] = override.get('wmax')
+        hdu[1].header.set('BINSIZE',override.get('binsize'),'Time step in seconds')
 
         hdu[0].header['DATE-OBS'] = Time(hdu[1].data['MJD'].min(), format='mjd').iso
         hdu[0].header['EXPSTART'] = hdu[1].data['mjd'].min()
         hdu[0].header['EXPEND'] = hdu[1].data['mjd'].max()
-        hdu[0].header['EXPTIME'] = hdu[1].data['bins'].sum()
+        hdu[0].header.set('EXPTIME', hdu[1].data['bins'].sum(), 'effective exposure time')
+        hdu[1].header['DATE-OBS'] = Time(hdu[1].data['MJD'].min(), format='mjd').iso
+        hdu[1].header['EXPSTART'] = hdu[1].data['mjd'].min()
+        hdu[1].header['EXPEND'] = hdu[1].data['mjd'].max()
+        hdu[1].header.set('EXPTIME', hdu[1].data['bins'].sum(), 'effective exposure time')
 
+
+        #writing the source files
+        for i, exposure in enumerate(filelist):
+            if i==0:
+                hdu[1].header.set('SOURCE',exposure,'SOURCE FILES')
+            else:
+                hdu[1].header.set('SOURCE'+str(i),exposure,'SOURCE FILES')
 #-------------------------------------------------------------------------------
